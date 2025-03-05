@@ -1,0 +1,10 @@
+{
+    "rules": [
+      {
+        "description": "venmo - payment",
+        "amount": 850.00,
+        "day_range": [1, 5],
+        "category": "Rent"
+      }
+    ]
+  }
