@@ -29,6 +29,10 @@ var/
 # Cache
 cache/
 
+# Backup files
+*.bak
+expense_tracker.py.bak
+
 
 # Financial data - never commit these directories
 inputs/*
