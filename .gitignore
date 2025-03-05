@@ -29,6 +29,7 @@ var/
 # Cache
 cache/
 
+
 # Financial data - never commit these directories
 inputs/*
 outputs/*
