@@ -1,10 +1,31 @@
 {
     "rules": [
-      {
-        "description": "venmo - payment",
-        "amount": 850.00,
-        "day_range": [1, 5],
-        "category": "Rent"
-      }
+        {
+            "description": "venmo - payment",
+            "amount": 850.0,
+            "day_range": [
+                1,
+                5
+            ],
+            "category": "Rent"
+        },
+        {
+            "description": "Withdrawal Saving money",
+            "amount": 750.0,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Savings Withdrawal"
+        },
+        {
+            "description": "Moving to savings",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Uncategorized"
+        }
     ]
-  }
+}
