@@ -9,10 +9,12 @@ import time
 import signal
 import sys
 import logging
+import re
 from datetime import datetime
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, before_log, after_log
 from dotenv import load_dotenv
+from fuzzywuzzy import fuzz
 
 # Set up logging
 LOG_FILE = "expense_tracker.log"
@@ -59,6 +61,22 @@ CATEGORIZE_CACHE_FILE = os.path.join(CACHE_DIR, "categorize_cache.pkl")
 LLM_CACHE = {}  # Generic LLM request cache
 NORMALIZE_CACHE = {}  # Description normalization cache
 CATEGORIZE_CACHE = {}  # Transaction categorization cache
+
+# API usage tracking
+API_USAGE = {
+    "total_calls": 0,
+    "gpt4_calls": 0,
+    "gpt35_calls": 0,
+    "normalization_calls": 0,
+    "categorization_calls": 0,
+    "rule_generation_calls": 0,
+    "deduplication_calls": 0,
+    "token_estimate": 0,
+    "cost_estimate": 0.0
+}
+
+# List to store user corrections for rule generation
+CORRECTIONS = []  # Format: {"transaction": {...}, "original_category": "...", "new_category": "..."}
 
 # Ensure directories exist
 for directory in [OUTPUT_DIR, CACHE_DIR]:
@@ -161,7 +179,8 @@ def call_llm(prompt, model="gpt-4o", max_tokens=100, temperature=0.2, context=No
     """
     context_str = f" for {context}" if context else ""
     
-    # Use cheaper model for simpler tasks
+    # Use cheaper model for simpler tasks based on context
+    # Note: We're not accessing args directly here to avoid the NameError
     if context and "norm_batch" in str(context):
         # Use 3.5 for normalization tasks by default
         if model == "gpt-4o":
@@ -197,6 +216,43 @@ def call_llm(prompt, model="gpt-4o", max_tokens=100, temperature=0.2, context=No
         # Calculate duration
         duration = time.time() - start_time
         
+        # Update API usage statistics
+        API_USAGE["total_calls"] += 1
+        
+        # Track model-specific usage
+        if "gpt-4" in model:
+            API_USAGE["gpt4_calls"] += 1
+        elif "gpt-3.5" in model:
+            API_USAGE["gpt35_calls"] += 1
+            
+        # Track purpose-specific usage
+        if context:
+            if "norm" in str(context):
+                API_USAGE["normalization_calls"] += 1
+            elif "txn:" in str(context):
+                API_USAGE["categorization_calls"] += 1
+            elif "rule" in str(context):
+                API_USAGE["rule_generation_calls"] += 1
+            elif "dedupe" in str(context):
+                API_USAGE["deduplication_calls"] += 1
+        # Show feedback on API usage (but don't rely on args to avoid NameError)
+        # We'll just log this info instead of using the arg flag
+        logger.info(f"API Call: {model} - Total: {API_USAGE['total_calls']} (GPT-4: {API_USAGE['gpt4_calls']}, GPT-3.5: {API_USAGE['gpt35_calls']})")
+                
+        # Rough token estimation (to be improved with actual token counts)
+        prompt_tokens = len(prompt) / 3  # Very rough approximation
+        response_tokens = len(response.choices[0].message.content) / 2
+        total_tokens = prompt_tokens + response_tokens
+        API_USAGE["token_estimate"] += total_tokens
+        
+        # Very rough cost estimation
+        if "gpt-4" in model:
+            # Approximately $0.01 per 1K tokens for GPT-4
+            API_USAGE["cost_estimate"] += total_tokens * 0.00001
+        elif "gpt-3.5" in model:
+            # Approximately $0.001 per 1K tokens for GPT-3.5
+            API_USAGE["cost_estimate"] += total_tokens * 0.000001
+        
         # Log success
         logger.info(f"LLM call succeeded{context_str} in {duration:.2f}s")
         
@@ -225,6 +281,9 @@ def call_llm(prompt, model="gpt-4o", max_tokens=100, temperature=0.2, context=No
         # Re-raise the exception to trigger retry
         raise
         
+# Define correction cache file path
+CORRECTIONS_CACHE_FILE = os.path.join(CACHE_DIR, "corrections_cache.pkl")
+
 # Load existing caches if available
 def load_cache(cache_file, default=None):
     """Load cache from disk if it exists."""
@@ -249,6 +308,7 @@ def save_cache(cache_data, cache_file):
 # Load caches
 NORMALIZE_CACHE = load_cache(NORMALIZE_CACHE_FILE)
 CATEGORIZE_CACHE = load_cache(CATEGORIZE_CACHE_FILE)
+CORRECTIONS = load_cache(CORRECTIONS_CACHE_FILE, default=[])
 
 # Hardcoded category rules
 CATEGORY_RULES = {
@@ -304,6 +364,41 @@ def normalize_description(desc):
     for keyword in ["ach debit", "ach credit", "online", "payment", "*"]:
         desc = desc.replace(keyword, "")
     return " ".join(desc.split())
+
+def fuzzy_match(rule_text, transaction_text, threshold=80):
+    """
+    Perform fuzzy matching between rule keyword and transaction description.
+    
+    Args:
+        rule_text: The rule keyword text to look for
+        transaction_text: The transaction description to search in
+        threshold: Minimum score (0-100) required for a match
+        
+    Returns:
+        Boolean indicating if the match meets the threshold
+    """
+    # Convert inputs to strings and lowercase
+    rule_text = str(rule_text).lower().strip()
+    transaction_text = str(transaction_text).lower().strip()
+    
+    # Skip empty strings
+    if not rule_text or not transaction_text:
+        return False
+        
+    # First try exact matching (faster)
+    if rule_text in transaction_text:
+        return True
+        
+    # Use partial_ratio for substring-like matching
+    # This checks if rule_text is approximately a substring of transaction_text
+    score = fuzz.partial_ratio(rule_text, transaction_text)
+    
+    # For very short rule texts (1-2 chars), require higher threshold
+    if len(rule_text) <= 2:
+        adjusted_threshold = max(threshold, 90)  # Require at least 90% for very short strings
+        return score >= adjusted_threshold
+        
+    return score >= threshold
 
 def normalize_with_llm(description):
     """Use LLM to standardize transaction descriptions into a concise, consistent format, with caching."""
@@ -367,8 +462,13 @@ def normalize_with_llm(description):
         
         return basic_result
 
-def normalize_descriptions_batch(descriptions, max_batch_size=50):
+def normalize_descriptions_batch(descriptions):
     """Process multiple descriptions in a single LLM call with detailed logging and batch size control."""
+    # Get the global max_batch_size if it exists, otherwise use default
+    max_batch_size = 50  # Default batch size
+    # Try to get the batch size from the global scope
+    if 'max_batch_size' in globals():
+        max_batch_size = globals()['max_batch_size']
     # Log the batch processing request
     logger.info(f"Normalizing batch of {len(descriptions)} descriptions")
     
@@ -544,17 +644,17 @@ def normalize_descriptions_batch(descriptions, max_batch_size=50):
     return ordered_results
 
 def generate_rule_suggestions(df, threshold=0.7):
-    """Generate and save new categorization rules based on patterns in uncategorized transactions."""
+    """Generate and save new categorization rules based on uncategorized and corrected transactions."""
     uncategorized = df[df["Category"] == "Uncategorized"]
-    if len(uncategorized) < 3:  # Lowered minimum requirement to catch more patterns
-        print(f"Not enough uncategorized transactions ({len(uncategorized)}) to generate rules.")
-        return
+    if len(uncategorized) + len(CORRECTIONS) < 3:
+        print(f"Not enough data ({len(uncategorized)} uncategorized, {len(CORRECTIONS)} corrections) to generate rules.")
+        return False
         
-    # Log information about uncategorized transactions
-    logger.info(f"Generating rules for {len(uncategorized)} uncategorized transactions")
+    # Log information about uncategorized transactions and corrections
+    logger.info(f"Generating rules for {len(uncategorized)} uncategorized and {len(CORRECTIONS)} corrected transactions")
     
     # Display summary of uncategorized transactions to the user
-    print(f"\nAnalyzing {len(uncategorized)} uncategorized transactions to generate new rules...")
+    print(f"\nAnalyzing {len(uncategorized)} uncategorized and {len(CORRECTIONS)} corrected transactions...")
     
     # Group similar uncategorized transactions
     if 'NormalizedDesc' in uncategorized.columns:
@@ -566,22 +666,39 @@ def generate_rule_suggestions(df, threshold=0.7):
             for idx, row in pattern_groups.head(5).iterrows():
                 print(f"  {row['NormalizedDesc']}: {row['count']} transactions")
     
+    # Prepare corrections as a DataFrame-like JSON for consistency
+    corrections_json = json.dumps(CORRECTIONS, default=str) if CORRECTIONS else "[]"
+    
     prompt = f"""
-    Analyze these uncategorized transactions: {uncategorized.to_json(orient='records')}.
+    Analyze these transactions to suggest categorization rules:
+    - Uncategorized transactions: {uncategorized.to_json(orient='records')}
+    - Corrected transactions: {corrections_json}
+
+    For corrected transactions, pay special attention to the 'original_category' and 'new_category' fields
+    that show how users manually recategorized transactions.
     
-    IMPORTANT: Look for clear patterns that can be categorized with existing categories: 
-    {list(CATEGORY_RULES.keys())}
+    Use existing categories: {list(CATEGORY_RULES.keys())}
     
-    Return a JSON ARRAY of rule suggestions, each with:
-    - 'description': a specific keyword from transaction description (choose words that uniquely identify the merchant)
-    - 'amount': an optional specific amount (or null if amount varies)
-    - 'day_range': an optional day range (e.g., [1, 5]) or [1, 31] for full month (use [1, 31] if no clear date pattern)
-    - 'category': the suggested category from the list above
-    - 'confidence': your confidence in this rule (0.0-1.0)
-    - 'reasoning': brief explanation for why this category applies
+    Return a JSON ARRAY of rule suggestions in this EXACT format:
+    [
+      {
+        "description": "keyword from transaction description",
+        "amount": null,  // null if variable, or specific amount like 25.99
+        "day_range": [1, 5],  // start day and end day as integers
+        "category": "Category",  // category from the list above
+        "confidence": 0.9,  // confidence as decimal between 0 and 1
+        "reasoning": "Brief explanation"
+      },
+      // Add more suggestions here
+    ]
     
-    ONLY include rules with confidence >{threshold}.
-    Create at least 3 rule suggestions if possible, focusing on the most frequent patterns first.
+    IMPORTANT: 
+    - Use PROPER JSON syntax with double quotes for keys
+    - Make sure the confidence value is a number (not a string)
+    - Make sure day_range is a proper array with two integers
+    - Include complete closing brackets and braces
+    - Only include rules with confidence > {threshold}
+    - Aim for at least 3 suggestions, prioritizing frequent patterns
     """
     try:
         # Use our retry-enabled function
@@ -589,30 +706,108 @@ def generate_rule_suggestions(df, threshold=0.7):
             prompt,
             model="gpt-4o",
             max_tokens=200,
-            temperature=0.2
+            temperature=0.2,
+            context="rule_suggestions_with_corrections"
         )
         content = response.choices[0].message.content.strip()
         
+        # The LLM might return a JSON array or individual JSON objects
+        # Try wrapping the content in brackets if it doesn't start with [
+        if not content.strip().startswith('['):
+            # Check if it looks like JSON objects separated by commas
+            if '{' in content and '},' in content:
+                content = f"[{content}]"
+                logger.info("Wrapped content in array brackets to fix JSON format")
+            
         # Use our robust JSON parsing function - now expecting an array
-        suggestions = safe_json_parse(
-            content,
-            fallback=[],
-            context="rule suggestions"
-        )
+        try:
+            # First, we'll log the complete content to better understand what we're parsing
+            logger.info(f"Original JSON content length: {len(content)}")
+            logger.debug(f"Content to parse: {content[:500]}...")
+            
+            # Clean up the content for better parsing chance
+            # Sometimes LLMs return double-wrapped arrays or add extra brackets
+            cleaned_content = content.strip()
+            if cleaned_content.startswith('[[') and cleaned_content.endswith(']]'):
+                # Fix double-wrapped arrays
+                logger.info("Detected double-wrapped array, fixing format")
+                cleaned_content = cleaned_content[1:-1]
+                
+            # Try additional unwrapping if it's still malformed
+            if cleaned_content.startswith('[') and not cleaned_content.endswith(']'):
+                logger.info("Detected unclosed array, attempting to fix")
+                cleaned_content = cleaned_content + ']'
+                
+            # Fix truncated content (common issue with rule suggestions)
+            if "confidence" in cleaned_content and cleaned_content.endswith('0'):
+                logger.info("Detected truncated JSON, attempting to fix")
+                # Add closing brackets to potentially fix truncated JSON
+                if cleaned_content.count('{') > cleaned_content.count('}'):
+                    missing_braces = cleaned_content.count('{') - cleaned_content.count('}')
+                    cleaned_content = cleaned_content + '}'*missing_braces
+                if cleaned_content.count('[') > cleaned_content.count(']'):
+                    missing_brackets = cleaned_content.count('[') - cleaned_content.count(']')
+                    cleaned_content = cleaned_content + ']'*missing_brackets
+                    
+            # Use our robust JSON parsing with the cleaned content
+            suggestions = safe_json_parse(
+                cleaned_content,
+                fallback=[],
+                context="rule suggestions"
+            )
+            
+            # If still empty, try an alternative approach - parse each suggestion separately
+            if not suggestions and '{' in content:
+                logger.info("First parsing attempt failed, trying to extract individual JSON objects")
+                suggestions = []
+                # Find all JSON objects in the content
+                starts = [m.start() for m in re.finditer(r'{\s*"', content)]
+                for i, start in enumerate(starts):
+                    # Find the end of this object
+                    end = content.find('}", ', start)
+                    if end < 0:
+                        end = content.find('}', start)
+                    if end > 0:
+                        # Extract and parse the individual object
+                        obj_str = content[start:end+1]
+                        try:
+                            obj = json.loads(obj_str)
+                            suggestions.append(obj)
+                            logger.info(f"Successfully extracted object {i+1}")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse extracted object {i+1}: {obj_str[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Error preprocessing JSON content: {str(e)}")
+            suggestions = []
         
         # Make sure we have a list of suggestions
         if not isinstance(suggestions, list):
+            # Single object returned
             suggestions = [suggestions]
             
+        # Log what we parsed
+        logger.info(f"Parsed {len(suggestions)} rule suggestions")
+        
         # Filter out suggestions without a category or with 'Uncategorized'
         valid_suggestions = []
         for suggestion in suggestions:
+            # Skip invalid suggestions
+            if not isinstance(suggestion, dict):
+                logger.warning(f"Skipping non-dict suggestion: {suggestion}")
+                continue
+                
             if suggestion.get("category") and suggestion["category"] != "Uncategorized":
+                # Skip suggestions that are missing required fields
+                if "description" not in suggestion:
+                    logger.warning(f"Skipping suggestion without description: {suggestion}")
+                    continue
+                    
                 # Format the suggestion to include confidence and reasoning if missing
                 if "confidence" not in suggestion:
                     suggestion["confidence"] = threshold + 0.1
                 if "reasoning" not in suggestion:
-                    suggestion["reasoning"] = "Pattern identified in uncategorized transactions"
+                    suggestion["reasoning"] = "Pattern identified in transactions"
                     
                 # Store just the fields needed for rules
                 rule = {
@@ -637,13 +832,14 @@ def generate_rule_suggestions(df, threshold=0.7):
             print(f"\nAdded {len(valid_suggestions)} new rules to categories.json")
             
             # Ask if user wants to re-categorize now
-            recategorize = input("\nRe-categorize transactions with new rules? (y/n): ").lower().strip()
-            return recategorize == 'y'
+            recategorize = input("\nRe-categorize transactions with new rules? ").lower().strip()
+            return any(yes_word in recategorize for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it'])
         else:
             print("No valid rule suggestions found.")
             return False
     except Exception as e:
         print(f"Error generating rule suggestions: {e}")
+        return False
         
 def suggest_custom_rules():
     """Suggest custom rules to improve categorization of common transactions."""
@@ -682,8 +878,8 @@ def suggest_custom_rules():
     print("\nFor personalized categorization, fill in specific names/amounts from your payment history.")
     print("Example: {'description': 'zelle fernando', 'amount': 1800.00, 'day_range': [1, 5], 'category': 'Rent'}")
     
-    add_rules = input("\nAdd these sample rules to categories.json? (y/n): ").lower().strip()
-    if add_rules == 'y':
+    add_rules = input("\nAdd these sample rules to categories.json? ").lower().strip()
+    if any(yes_word in add_rules for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it']):
         # Merge with existing rules
         combined_rules = CUSTOM_RULES + suggestions
         with open("categories.json", "w") as f:
@@ -693,15 +889,20 @@ def suggest_custom_rules():
     return
 
 def interactive_review(df):
-    """Allow users to review and correct LLM categorization suggestions."""
+    """Allow users to review and correct LLM categorization suggestions with natural language support."""
     print("\n=== Starting Interactive Review of Low Confidence Transactions ===\n")
     print("This tool will help you review transactions where the AI is uncertain.")
-    print("You can accept the AI's suggestion, change the category, or skip to the next transaction.")
+    print("You can respond in natural language to accept, change, skip, or quit.")
+    print("Examples:")
+    print("  - 'Yes' or 'looks good' to accept the current category")
+    print("  - 'Change to Food' or 'this should be Entertainment' to change the category")
+    print("  - 'Skip' or 'next' to move to the next transaction")
+    print("  - 'Quit' or 'exit' to stop the review")
     print("Any changes you make will be saved as custom rules for future transactions.\n")
     
     # Option to view rule suggestions
     show_rule_suggestions = input("Would you like to see suggestions for custom payment rules? (y/n): ").lower().strip()
-    if show_rule_suggestions == 'y':
+    if any(answer in show_rule_suggestions for answer in ['y', 'yes', 'yeah', 'sure', 'ok']):
         suggest_custom_rules()
     
     # Get valid categories
@@ -717,74 +918,136 @@ def interactive_review(df):
     changes_made = False
     
     try:
-        # Focus on low confidence transactions
+        # Focus on low confidence transactions, sorted by confidence (lowest first)
         low_confidence = df[df["Confidence"] < 0.8].copy()
         if len(low_confidence) == 0:
             print("No low-confidence transactions found. All transactions have been categorized with high confidence!")
             return
-            
-        print(f"Found {len(low_confidence)} transactions with confidence score below 0.8")
         
-        for idx, row in low_confidence.iterrows():
+        # Sort by confidence (ascending) first, then by Category to group "Uncategorized" together
+        review_df = low_confidence.sort_values(by=["Confidence", "Category"])
+        
+        # Show both total count and uncategorized count
+        uncategorized_count = sum(review_df["Category"] == "Uncategorized")
+        print(f"Found {len(review_df)} transactions with confidence score below 0.8")
+        print(f"Of these, {uncategorized_count} are marked as 'Uncategorized' and need your input")
+        print("Transactions are sorted by confidence level, showing least confident first.\n")
+        
+        for idx, row in review_df.iterrows():
             print("\n" + "="*80)
             print(f"Transaction: {row['Description']}")
             print(f"Normalized: {row['NormalizedDesc']}")
             print(f"Amount: ${row['Amount']:.2f}, Date: {row['Date']}, Source: {row['Source']}")
             print(f"Current Category: {row['Category']} (Confidence: {row['Confidence']:.2f})")
+            
+            # For previously uncategorized transactions, add clearer instruction
+            if row['Category'] == 'Uncategorized':
+                print("This transaction needs categorization.")
+                
+                # If the reasoning contains the original category suggestion, extract and display it
+                if 'Original reasoning' in row['Reasoning']:
+                    # Try to extract the original AI suggestion if available
+                    match = re.search(r"Low confidence \([0-9.]+\) for '([^']+)'", row['Reasoning'])
+                    if match:
+                        suggested_category = match.group(1)
+                        print(f"AI suggested '{suggested_category}' with low confidence")
+            
             print(f"AI Reasoning: {row['Reasoning']}")
             
-            choice = input("\nAccept (y), Change (c), Skip (s), Quit (q): ").lower().strip()
+            # Use natural language prompt and parse the response
+            user_response = input("\nWhat would you like to do with this transaction? ").lower().strip()
             
-            if choice == "q":
+            # Parse the user's natural language response
+            if any(quit_word in user_response for quit_word in ['quit', 'exit', 'stop', 'end', 'done', 'q']):
                 print("Exiting review mode...")
                 break
                 
-            elif choice == "c":
-                # Show category options
-                print("\nEnter the number or name of the new category:")
-                for i, category in enumerate(valid_categories, 1):
-                    print(f"{i}. {category}")
+            elif any(change_word in user_response for change_word in ['change', 'edit', 'update', 'correct', 'modify', 'should be', 'change to', 'make it']):
+                # Try to extract category from the response
+                extracted_category = None
                 
-                category_input = input("\nNew category: ").strip()
+                # Check if any category name is mentioned in the response
+                # First look for explicit patterns like "change to Food" or "should be Entertainment"
+                for pattern in ["change to ", "should be ", "make it ", "change it to ", "set as ", "set to ", "categorize as "]:
+                    if pattern in user_response:
+                        # Get the text after the pattern
+                        text_after = user_response.split(pattern)[1].strip()
+                        # Find the best category match
+                        for category in valid_categories:
+                            if category.lower() in text_after.lower():
+                                extracted_category = category
+                                break
+                        if extracted_category:
+                            break
                 
-                # Handle numeric input
-                if category_input.isdigit() and 1 <= int(category_input) <= len(valid_categories):
-                    new_category = valid_categories[int(category_input) - 1]
-                else:
-                    # Check if input matches a category name
-                    if category_input in valid_categories:
-                        new_category = category_input
+                # If not found with patterns, look for any category name in the response
+                if not extracted_category:
+                    for category in valid_categories:
+                        if category.lower() in user_response:
+                            extracted_category = category
+                            break
+                
+                # If we couldn't extract a category, ask explicitly
+                if not extracted_category:
+                    print("\nEnter the number or name of the new category:")
+                    for i, category in enumerate(valid_categories, 1):
+                        print(f"{i}. {category}")
+                    
+                    category_input = input("\nNew category: ").strip()
+                    
+                    # Handle numeric input
+                    if category_input.isdigit() and 1 <= int(category_input) <= len(valid_categories):
+                        extracted_category = valid_categories[int(category_input) - 1]
                     else:
-                        print(f"Invalid category. Using 'Uncategorized' instead.")
-                        new_category = "Uncategorized"
+                        # Check if input matches a category name (case-insensitive)
+                        category_match = next((cat for cat in valid_categories if cat.lower() == category_input.lower()), None)
+                        if category_match:
+                            extracted_category = category_match
+                        else:
+                            print(f"Invalid category. Using 'Uncategorized' instead.")
+                            extracted_category = "Uncategorized"
                 
-                # Update dataframe
-                df.at[idx, "Category"] = new_category
+                # Store the original category
+                original_category = row["Category"]
+                
+                # Update dataframe with the new category
+                df.at[idx, "Category"] = extracted_category
                 df.at[idx, "Confidence"] = 1.0
                 df.at[idx, "Reasoning"] = "User override during interactive review"
                 
-                # Create a rule based on this correction
-                # Ask if the user wants to create a custom rule
-                create_rule = input("\nCreate a custom rule based on this transaction? (y/n): ").lower().strip()
-                if create_rule == "y":
+                # Record the correction in the global CORRECTIONS list
+                correction = {
+                    "transaction": row.to_dict(),
+                    "original_category": original_category,
+                    "new_category": extracted_category
+                }
+                CORRECTIONS.append(correction)
+                logger.info(f"User correction recorded: '{row['Description']}' from {original_category} to {extracted_category}")
+                
+                # Ask about creating a rule
+                create_rule_response = input("\nWould you like to create a rule for similar transactions in the future? ").lower().strip()
+                if any(yes_word in create_rule_response for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'create', 'rule']):
                     # Extract key terms from description
                     desc_words = row["Description"].lower().split()
-                    key_term = input(f"Enter a keyword from the description to match similar transactions (default: {desc_words[0]}): ").strip()
-                    if not key_term:
-                        key_term = desc_words[0].lower()
+                    key_term_prompt = f"Enter a keyword from the description to match similar transactions (default: {desc_words[0]}): "
+                    key_term_response = input(key_term_prompt).strip()
+                    key_term = key_term_response if key_term_response else desc_words[0].lower()
                     
                     # Ask about amount matching
-                    amount_specific = input(f"Should this rule only match transactions with amount ${row['Amount']:.2f}? (y/n): ").lower().strip()
-                    amount = float(row["Amount"]) if amount_specific == "y" else None
+                    amount_prompt = f"Should this rule only match transactions with amount ${row['Amount']:.2f}? "
+                    amount_response = input(amount_prompt).lower().strip()
+                    amount = float(row["Amount"]) if any(yes_word in amount_response for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok']) else None
                     
                     # Ask about day range
                     day = pd.to_datetime(row["Date"]).day
-                    day_range_input = input(f"Enter day range for the rule (default: {day-2}-{day+2}, or 'any' for full month): ").strip()
-                    if day_range_input.lower() == "any":
+                    day_range_prompt = f"Enter day range for the rule (default: {day-2}-{day+2}, or 'any' for full month): "
+                    day_range_response = input(day_range_prompt).strip()
+                    
+                    if any(word in day_range_response.lower() for word in ['any', 'all', 'full', 'month', 'every']):
                         day_range = [1, 31]
-                    elif "-" in day_range_input:
+                    elif "-" in day_range_response:
                         try:
-                            start, end = map(int, day_range_input.split("-"))
+                            start, end = map(int, day_range_response.split("-"))
                             day_range = [start, end]
                         except:
                             day_range = [max(1, day-2), min(31, day+2)]
@@ -796,24 +1059,40 @@ def interactive_review(df):
                         "description": key_term,
                         "amount": amount,
                         "day_range": day_range,
-                        "category": new_category
+                        "category": extracted_category
                     }
                     
                     CUSTOM_RULES.append(new_rule)
                     changes_made = True
                     print(f"Added new rule: {new_rule}")
                 
-                print(f"Updated category to: {new_category}")
+                print(f"Updated category to: {extracted_category}")
                 
-            elif choice == "y":
-                print("Accepted current category.")
-            else:
+            # Skip logic
+            elif any(skip_word in user_response for skip_word in ['skip', 'next', 'pass', 'continue', 's']):
                 print("Skipping to next transaction.")
+            
+            # Accept logic - anything that sounds positive and isn't covered by other commands
+            elif any(accept_word in user_response for accept_word in [
+                'y', 'yes', 'accept', 'good', 'correct', 'agree', 'approve', 'right', 
+                'fine', 'ok', 'okay', 'sure', 'looks good', 'keep', 'makes sense'
+            ]):
+                print("Accepted current category.")
+            
+            # Default case if we couldn't parse the command
+            else:
+                print("I'm not sure what you want to do. Skipping to the next transaction.")
+                print("Tip: You can say 'yes' to accept, 'change to Food' to change category, 'skip' to move on, or 'quit' to exit.")
         
         if changes_made:
             with open("categories.json", "w") as f:
                 json.dump({"rules": CUSTOM_RULES}, f, indent=4)
             print("\nSaved updated rules to categories.json")
+        
+        # Save corrections for future rule generation
+        if CORRECTIONS:
+            save_cache(CORRECTIONS, CORRECTIONS_CACHE_FILE)
+            print(f"Saved {len(CORRECTIONS)} user corrections for future rule generation")
         
         print("\n=== Interactive Review Complete ===\n")
         
@@ -827,8 +1106,225 @@ def interactive_review(df):
             with open("categories.json", "w") as f:
                 json.dump({"rules": CUSTOM_RULES}, f, indent=4)
             print("Saved updated rules to categories.json")
+        
+        # Save corrections even in case of interruption
+        if CORRECTIONS:
+            save_cache(CORRECTIONS, CORRECTIONS_CACHE_FILE)
+            print(f"Saved {len(CORRECTIONS)} user corrections for future rule generation")
+            
         df.to_csv(DEDUPE_CSV, index=False)
         print(f"Saved updates to {DEDUPE_CSV}")
+
+def generate_rules_from_corrections():
+    """Generate rules based on user corrections collected during interactive review."""
+    global CORRECTIONS
+    
+    if not CORRECTIONS:
+        print("No user corrections available to generate rules from.")
+        return False
+    
+    print(f"\nAnalyzing {len(CORRECTIONS)} user corrections to generate intelligent rules...")
+    
+    # Group corrections by new category to identify patterns
+    by_category = {}
+    for correction in CORRECTIONS:
+        new_category = correction["new_category"]
+        if new_category not in by_category:
+            by_category[new_category] = []
+        by_category[new_category].append(correction)
+    
+    # Show summary of corrections
+    print("\nCorrections by category:")
+    for category, corrections in by_category.items():
+        print(f"  {category}: {len(corrections)} corrections")
+    
+    # Prepare the prompt with detailed information about the corrections
+    prompt = f"""
+    Analyze these user corrections where the user manually changed AI-suggested categories:
+    {json.dumps(CORRECTIONS, default=str)}
+    
+    IMPORTANT INSTRUCTIONS:
+    1. Identify common patterns in transactions that the user consistently recategorizes
+    2. Look for keywords in descriptions that could be used as rules
+    3. Pay attention to amount patterns (e.g., consistent amounts for rent)
+    4. Consider date patterns (e.g., recurring expenses at specific days of month)
+    5. Focus especially on corrections where the AI repeatedly made the same mistake
+    
+    Return a JSON ARRAY of rule suggestions in this EXACT format:
+    [
+      {
+        "description": "keyword from transaction description",
+        "amount": null,  // null if variable, or specific amount like 25.99
+        "day_range": [1, 5],  // start day and end day as integers
+        "category": "Category",  // category from the list above
+        "confidence": 0.9,  // confidence as decimal between 0 and 1
+        "reasoning": "Brief explanation of why this rule aligns with user's categorization preferences"
+      },
+      // Add more suggestions here
+    ]
+    
+    IMPORTANT: 
+    - Use PROPER JSON syntax with double quotes for keys
+    - Make sure the confidence value is a number (not a string)
+    - Make sure day_range is a proper array with two integers
+    - Include complete closing brackets and braces
+    - ONLY include rules with confidence >0.85
+    - Create at least 3 rule suggestions if possible, focusing on the most consistent correction patterns
+    - Choose words that uniquely identify the merchant or transaction type
+    """
+    
+    try:
+        # Use our retry-enabled function with special context
+        response = call_llm(
+            prompt,
+            model="gpt-4o",  # Use the more capable model for this analysis
+            max_tokens=400,
+            temperature=0.2,
+            context="user_corrections_analysis"
+        )
+        content = response.choices[0].message.content.strip()
+        
+        # The LLM might return a JSON array or individual JSON objects
+        if not content.strip().startswith('['):
+            # Check if it looks like JSON objects separated by commas
+            if '{' in content and '},' in content:
+                content = f"[{content}]"
+                logger.info("Wrapped content in array brackets to fix JSON format for correction-based rules")
+        
+        # Apply same robust JSON parsing as in generate_rule_suggestions
+        try:
+            # Log the content for debugging
+            logger.info(f"Original JSON content length: {len(content)}")
+            logger.debug(f"Content to parse: {content[:500]}...")
+            
+            # Clean up the content for better parsing chance
+            cleaned_content = content.strip()
+            if cleaned_content.startswith('[[') and cleaned_content.endswith(']]'):
+                # Fix double-wrapped arrays
+                logger.info("Detected double-wrapped array, fixing format")
+                cleaned_content = cleaned_content[1:-1]
+                
+            # Try additional unwrapping if it's still malformed
+            if cleaned_content.startswith('[') and not cleaned_content.endswith(']'):
+                logger.info("Detected unclosed array, attempting to fix")
+                cleaned_content = cleaned_content + ']'
+                
+            # Fix truncated content
+            if "confidence" in cleaned_content and cleaned_content.endswith('0'):
+                logger.info("Detected truncated JSON, attempting to fix")
+                # Add closing brackets to potentially fix truncated JSON
+                if cleaned_content.count('{') > cleaned_content.count('}'):
+                    missing_braces = cleaned_content.count('{') - cleaned_content.count('}')
+                    cleaned_content = cleaned_content + '}'*missing_braces
+                if cleaned_content.count('[') > cleaned_content.count(']'):
+                    missing_brackets = cleaned_content.count('[') - cleaned_content.count(']')
+                    cleaned_content = cleaned_content + ']'*missing_brackets
+                    
+            # Use our robust JSON parsing with the cleaned content
+            suggestions = safe_json_parse(
+                cleaned_content,
+                fallback=[],
+                context="user correction rules"
+            )
+            
+            # If still empty, try an alternative approach - parse each suggestion separately
+            if not suggestions and '{' in content:
+                logger.info("First parsing attempt failed, trying to extract individual JSON objects")
+                suggestions = []
+                # Find all JSON objects in the content
+                starts = [m.start() for m in re.finditer(r'{\s*"', content)]
+                for i, start in enumerate(starts):
+                    # Find the end of this object
+                    end = content.find('}", ', start)
+                    if end < 0:
+                        end = content.find('}', start)
+                    if end > 0:
+                        # Extract and parse the individual object
+                        obj_str = content[start:end+1]
+                        try:
+                            obj = json.loads(obj_str)
+                            suggestions.append(obj)
+                            logger.info(f"Successfully extracted object {i+1}")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse extracted object {i+1}: {obj_str[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Error preprocessing JSON content: {str(e)}")
+            suggestions = []
+        
+        if not isinstance(suggestions, list):
+            suggestions = [suggestions]
+            
+        # Log what we parsed    
+        logger.info(f"Parsed {len(suggestions)} rule suggestions from user corrections")
+        
+        # Process and add valid rule suggestions
+        valid_suggestions = []
+        new_rules_added = 0
+        
+        print("\nGenerated rule suggestions from user corrections:")
+        
+        for suggestion in suggestions:
+            # Skip invalid objects
+            if not isinstance(suggestion, dict):
+                logger.warning(f"Skipping non-dict suggestion: {suggestion}")
+                continue
+                
+            if suggestion.get("category") and suggestion["category"] != "Uncategorized":
+                # Format the suggestion to include required fields
+                if "confidence" not in suggestion:
+                    suggestion["confidence"] = 0.9  # Default high confidence for user-derived rules
+                
+                # Skip low confidence suggestions
+                if suggestion.get("confidence", 0) < 0.85:
+                    continue
+                
+                # Check if a similar rule already exists
+                similar_rule_exists = False
+                for rule in CUSTOM_RULES:
+                    if (rule.get("description") == suggestion.get("description") and 
+                        rule.get("category") == suggestion.get("category")):
+                        similar_rule_exists = True
+                        break
+                
+                if not similar_rule_exists:
+                    # Create a clean rule without extra fields
+                    rule = {
+                        "description": suggestion["description"],
+                        "amount": suggestion.get("amount"),
+                        "day_range": suggestion.get("day_range", [1, 31]),
+                        "category": suggestion["category"]
+                    }
+                    
+                    valid_suggestions.append(rule)
+                    CUSTOM_RULES.append(rule)
+                    new_rules_added += 1
+                    
+                    # Print details about the new rule
+                    print(f"Added rule: '{rule['description']}' → {rule['category']} ({suggestion.get('confidence', 0.9):.1f})")
+                    if "reasoning" in suggestion:
+                        print(f"  Reasoning: {suggestion['reasoning']}")
+        
+        if new_rules_added > 0:
+            with open("categories.json", "w") as f:
+                json.dump({"rules": CUSTOM_RULES}, f, indent=4)
+            print(f"\nAdded {new_rules_added} new rules based on your previous corrections")
+            
+            # Clear the corrections after processing them
+            CORRECTIONS = []
+            # Save the empty corrections list to disk
+            save_cache(CORRECTIONS, CORRECTIONS_CACHE_FILE)
+            
+            # Ask if user wants to re-categorize now
+            recategorize = input("\nRe-categorize transactions with these new rules? ").lower().strip()
+            return any(yes_word in recategorize for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it'])
+        else:
+            print("No additional rules could be derived from user corrections.")
+            return False
+    except Exception as e:
+        print(f"Error generating rules from user corrections: {e}")
+        logger.error(f"Error in generate_rules_from_corrections: {e}")
+        return False
 
 def generate_low_confidence_rules(df, confidence_threshold=0.7):
     """Generate rules for transactions with low confidence scores."""
@@ -870,17 +1366,27 @@ def generate_low_confidence_rules(df, confidence_threshold=0.7):
     3. Look for common merchants, transaction types, or patterns across multiple transactions
     4. Consider consistent patterns in amounts, descriptions, or dates
     
-    Return a JSON ARRAY of rule suggestions, each with:
-    - 'description': a specific keyword from transaction description (choose words that uniquely identify the merchant)
-    - 'amount': an optional specific amount (or null if amount varies)
-    - 'day_range': an optional day range (e.g., [1, 5]) or [1, 31] for full month (use [1, 31] if no clear date pattern)
-    - 'category': the suggested category (must be one of: {list(CATEGORY_RULES.keys())})
-    - 'confidence': your confidence in this rule (0.0-1.0)
-    - 'reasoning': brief explanation for why this rule would improve categorization
+    Return a JSON ARRAY of rule suggestions in this EXACT format:
+    [
+      {
+        "description": "keyword from transaction description",
+        "amount": null,  // null if variable, or specific amount like 25.99
+        "day_range": [1, 5],  // start day and end day as integers
+        "category": "Category",  // category from the list above
+        "confidence": 0.9,  // confidence as decimal between 0 and 1
+        "reasoning": "Brief explanation for why this rule would improve categorization"
+      },
+      // Add more suggestions here
+    ]
     
-    ONLY include rules with confidence >0.8.
-    If you see any major miscategorizations, note them in your reasoning.
-    Create at least 5 rule suggestions if possible, focusing on the most frequent patterns first.
+    IMPORTANT: 
+    - Use PROPER JSON syntax with double quotes for keys
+    - Make sure the confidence value is a number (not a string)
+    - Make sure day_range is a proper array with two integers
+    - Include complete closing brackets and braces
+    - ONLY include rules with confidence >0.8
+    - If you see any major miscategorizations, note them in your reasoning
+    - Create at least 5 rule suggestions if possible, focusing on the most frequent patterns first
     """
     try:
         # Use our retry-enabled function
@@ -892,14 +1398,80 @@ def generate_low_confidence_rules(df, confidence_threshold=0.7):
         )
         content = response.choices[0].message.content.strip()
         
-        # Use our robust JSON parsing function
-        suggestions = safe_json_parse(
-            content, 
-            fallback=[],
-            context="low confidence rules"
-        )
+        # The LLM might return a JSON array or individual JSON objects
+        # Try wrapping the content in brackets if it doesn't start with [
+        if not content.strip().startswith('['):
+            # Check if it looks like JSON objects separated by commas
+            if '{' in content and '},' in content:
+                content = f"[{content}]"
+                logger.info("Wrapped content in array brackets to fix JSON format for low confidence rules")
+            
+        # Apply same robust JSON parsing as in generate_rule_suggestions
+        try:
+            # Log the content for debugging
+            logger.info(f"Original JSON content length: {len(content)}")
+            logger.debug(f"Content to parse: {content[:500]}...")
+            
+            # Clean up the content for better parsing chance
+            cleaned_content = content.strip()
+            if cleaned_content.startswith('[[') and cleaned_content.endswith(']]'):
+                # Fix double-wrapped arrays
+                logger.info("Detected double-wrapped array, fixing format")
+                cleaned_content = cleaned_content[1:-1]
+                
+            # Try additional unwrapping if it's still malformed
+            if cleaned_content.startswith('[') and not cleaned_content.endswith(']'):
+                logger.info("Detected unclosed array, attempting to fix")
+                cleaned_content = cleaned_content + ']'
+                
+            # Fix truncated content
+            if "confidence" in cleaned_content and cleaned_content.endswith('0'):
+                logger.info("Detected truncated JSON, attempting to fix")
+                # Add closing brackets to potentially fix truncated JSON
+                if cleaned_content.count('{') > cleaned_content.count('}'):
+                    missing_braces = cleaned_content.count('{') - cleaned_content.count('}')
+                    cleaned_content = cleaned_content + '}'*missing_braces
+                if cleaned_content.count('[') > cleaned_content.count(']'):
+                    missing_brackets = cleaned_content.count('[') - cleaned_content.count(']')
+                    cleaned_content = cleaned_content + ']'*missing_brackets
+                    
+            # Use our robust JSON parsing with the cleaned content
+            suggestions = safe_json_parse(
+                cleaned_content,
+                fallback=[],
+                context="low confidence rules"
+            )
+            
+            # If still empty, try an alternative approach - parse each suggestion separately
+            if not suggestions and '{' in content:
+                logger.info("First parsing attempt failed, trying to extract individual JSON objects")
+                suggestions = []
+                # Find all JSON objects in the content
+                starts = [m.start() for m in re.finditer(r'{\s*"', content)]
+                for i, start in enumerate(starts):
+                    # Find the end of this object
+                    end = content.find('}", ', start)
+                    if end < 0:
+                        end = content.find('}', start)
+                    if end > 0:
+                        # Extract and parse the individual object
+                        obj_str = content[start:end+1]
+                        try:
+                            obj = json.loads(obj_str)
+                            suggestions.append(obj)
+                            logger.info(f"Successfully extracted object {i+1}")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse extracted object {i+1}: {obj_str[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Error preprocessing JSON content: {str(e)}")
+            suggestions = []
+        
         if not isinstance(suggestions, list):
             suggestions = [suggestions]
+            
+        # Log what we parsed    
+        logger.info(f"Parsed {len(suggestions)} low confidence rule suggestions")
         
         # Filter valid suggestions and check for duplicates
         valid_suggestions = []
@@ -908,6 +1480,11 @@ def generate_low_confidence_rules(df, confidence_threshold=0.7):
         print("\nAnalyzing low confidence patterns...")
         
         for suggestion in suggestions:
+            # Skip invalid objects
+            if not isinstance(suggestion, dict):
+                logger.warning(f"Skipping non-dict suggestion: {suggestion}")
+                continue
+                
             if suggestion.get("category") and suggestion["category"] != "Uncategorized":
                 # Format the suggestion to include required fields
                 if "confidence" not in suggestion:
@@ -949,8 +1526,8 @@ def generate_low_confidence_rules(df, confidence_threshold=0.7):
             print(f"\nAdded {new_rules_added} new rules from low confidence transaction analysis")
             
             # Ask if user wants to re-categorize now
-            recategorize = input("\nRe-categorize transactions with new rules? (y/n): ").lower().strip()
-            return recategorize == 'y'
+            recategorize = input("\nRe-categorize transactions with new rules? ").lower().strip()
+            return any(yes_word in recategorize for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it'])
         else:
             print("No additional rules identified from low confidence transactions.")
             return False
@@ -1120,6 +1697,10 @@ def dedupe_with_llm(df):
 
 def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
     """Categorize a transaction using GPT-4 with caching."""
+    # Initialize variables to avoid reference before assignment
+    examples_dict = None
+    fallback_result = ("Uncategorized", 0.0, "Unable to categorize (fallback)")
+    
     # Create a cache key based on critical transaction details
     # We don't include past_transactions in the key as it might change frequently
     # and we want to leverage the cache even if past_transactions changes slightly
@@ -1164,11 +1745,18 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
     desc_lower = df_row['Description'].lower()
     norm_desc_lower = normalized_desc.lower() if normalized_desc != "Not Available" else ""
     
+    # Get the fuzzy threshold from global args if available
+    fuzzy_threshold = 80  # Default
+    if 'args' in globals() and hasattr(globals()['args'], 'fuzzy_threshold'):
+        fuzzy_threshold = globals()['args'].fuzzy_threshold
+    
     # Check against expanded CATEGORY_RULES
     for category, keywords in CATEGORY_RULES.items():
+        # First try exact matching (faster)
         if any(keyword.lower() in desc_lower for keyword in keywords) or \
            any(keyword.lower() in norm_desc_lower for keyword in keywords):
-            # Found a match in rules, return with high confidence
+            # Found an exact match in rules, return with high confidence
+            match_type = "exact"
             reasoning = f"Matched rule keyword in {'description' if any(keyword.lower() in desc_lower for keyword in keywords) else 'normalized description'}"
             result = (category, 0.95, reasoning)
             
@@ -1183,28 +1771,117 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
                     'Source': df_row['Source']
                 },
                 'hits': 1,
-                'rule_based': True
+                'rule_based': True,
+                'match_type': match_type
             }
             
-            # Also add to simplified cache
-            CATEGORIZE_CACHE[simple_cache_key] = {
-                'result': result,
-                'timestamp': datetime.now().isoformat(),
-                'hits': 1,
-                'rule_based': True
-            }
-            
-            # Periodically save cache to disk
-            if len(CATEGORIZE_CACHE) % 10 == 0:
-                save_cache(CATEGORIZE_CACHE, CATEGORIZE_CACHE_FILE)
-                
-            logger.info(f"Rule-based categorization: {df_row['Description'][:30]} -> {category}")
             return result
+        
+        # If no exact match, try fuzzy matching
+        for keyword in keywords:
+            if (fuzzy_match(keyword.lower(), desc_lower, fuzzy_threshold) or 
+                fuzzy_match(keyword.lower(), norm_desc_lower, fuzzy_threshold)):
+                
+                # Log the match for debugging
+                logger.debug(f"Fuzzy match: '{keyword}' -> '{desc_lower}' (category: {category})")
+                
+                match_type = "fuzzy"
+                reasoning = f"Fuzzy matched rule keyword '{keyword}' in {'description' if fuzzy_match(keyword.lower(), desc_lower, fuzzy_threshold) else 'normalized description'}"
+                result = (category, 0.9, reasoning)
+                
+                # Cache the result in both caches
+                CATEGORIZE_CACHE[cache_key] = {
+                    'result': result,
+                    'timestamp': datetime.now().isoformat(),
+                    'transaction': {
+                        'Description': df_row['Description'],
+                        'Amount': float(df_row['Amount']),
+                        'Date': df_row['Date'],
+                        'Source': df_row['Source']
+                    },
+                    'hits': 1,
+                    'rule_based': True,
+                    'match_type': match_type
+                }
+                
+                # Also add to simplified cache
+                CATEGORIZE_CACHE[simple_cache_key] = {
+                    'result': result,
+                    'timestamp': datetime.now().isoformat(),
+                    'hits': 1,
+                    'rule_based': True,
+                    'match_type': match_type
+                }
+                
+                # Periodically save cache to disk
+                if len(CATEGORIZE_CACHE) % 10 == 0:
+                    save_cache(CATEGORIZE_CACHE, CATEGORIZE_CACHE_FILE)
+                    
+                logger.info(f"Rule-based categorization: {df_row['Description'][:30]} -> {category}")
+                return result
     
-    # If no rule match, proceed with LLM categorization
+    # If no rule match, proceed with LLM categorization with enhanced contextual examples
+    # This will be our fallback if something goes wrong in the process
+    examples_str = ""
+    
+    # Check if past_transactions contains our enhanced examples dictionary
+    if past_transactions is not None and isinstance(past_transactions, dict) and "examples" in past_transactions:
+        examples_dict = past_transactions["examples"]
+        
+        # Format examples from the dictionary into a string
+        if examples_dict:
+            examples_str = "Here are some examples of categorized transactions:\n"
+            
+            # Add examples for each category
+            for category, example_list in examples_dict.items():
+                if example_list:
+                    # Include up to 3 examples per category to keep the prompt concise
+                    for example in example_list[:3]:
+                        examples_str += f"- {example} → {category}\n"
+            
+            examples_str += "\n"
+            
+    # If we don't have dictionary examples, try the traditional dataframe approach
+    elif past_transactions is not None and (
+        isinstance(past_transactions, pd.DataFrame) or 
+        (isinstance(past_transactions, dict) and "dataframe" in past_transactions and isinstance(past_transactions["dataframe"], pd.DataFrame))
+    ):
+        # Get the dataframe from either format
+        df = past_transactions if isinstance(past_transactions, pd.DataFrame) else past_transactions["dataframe"]
+        
+        if not df.empty:
+            # Filter to include only transactions with high confidence and valid categories
+            example_txns = df[
+                (df['Confidence'] >= 0.9) & 
+                (df['Category'].notna()) & 
+                (df['Category'] != 'Uncategorized')
+            ]
+            
+            if not example_txns.empty:
+                examples_str = "Here are some examples of categorized transactions:\n"
+                
+                # Group by category to ensure diverse examples
+                by_category = {}
+                for cat in CATEGORY_RULES.keys():
+                    cat_examples = example_txns[example_txns['Category'] == cat]
+                    if not cat_examples.empty:
+                        # Take up to 2 examples per category
+                        by_category[cat] = cat_examples.sample(min(2, len(cat_examples)))
+                
+                # Add examples to the prompt
+                for category, txns in by_category.items():
+                    for _, txn in txns.iterrows():
+                        desc = txn['Description']
+                        amount = txn['Amount']
+                        date = txn['Date']
+                        examples_str += f"- '{desc}' (${amount:.2f} on {date}) → {category}\n"
+                
+                examples_str += "\n"
+    
     prompt = f"""
     Categorize this transaction into one of: {list(CATEGORY_RULES.keys()) + ['Uncategorized']}.
-    Transaction: 
+    
+    {examples_str}Transaction: 
     - Date: '{df_row['Date']}'
     - Original Description: '{df_row['Description']}'
     - Normalized Description: '{normalized_desc}'
@@ -1271,10 +1948,18 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
         if confidence < 0.7 and category == "Uncategorized":
             logger.info(f"Low confidence ({confidence}) with gpt-3.5, trying with gpt-4o for {context_id}")
             
-            # Use the more powerful model as a fallback
+            # Use the more powerful model as a fallback, unless model_downgrade is in effect
+            fallback_model = "gpt-4o"  # Default to the more powerful model
+            # Note: We can't access args directly here, so we use the global model_downgrade flag if it exists
+            if 'model_downgrade' in globals() and model_downgrade:
+                fallback_model = "gpt-3.5-turbo"
+                logger.info(f"Using {fallback_model} for fallback due to model_downgrade flag")
+            else:
+                logger.info(f"Using {fallback_model} as fallback for low confidence categorization")
+                
             response_4o = call_llm(
                 prompt, 
-                model="gpt-4o",  # Use the more powerful model
+                model=fallback_model,
                 max_tokens=100, 
                 temperature=0.2,
                 context=f"{context_id}-4o"
@@ -1312,14 +1997,16 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
                 'Date': df_row['Date'],
                 'Source': df_row['Source']
             },
-            'hits': 1
+            'hits': 1,
+            'match_type': 'llm'  # Mark this as an LLM match to distinguish from rule matches
         }
         
         # Also add to simplified cache
         CATEGORIZE_CACHE[simple_cache_key] = {
             'result': final_result,
             'timestamp': datetime.now().isoformat(),
-            'hits': 1
+            'hits': 1,
+            'match_type': 'llm'  # Mark this as an LLM match to distinguish from rule matches
         }
         
         # Periodically save cache to disk
@@ -1329,6 +2016,7 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
         return category, confidence, reasoning
     except Exception as e:
         # Log the error with detailed information
+        context_id = f"txn:[{df_row['Description'][:20]}...{df_row['Amount']}]"
         error_msg = f"Failed to categorize {context_id}: {str(e)}"
         logger.error(error_msg)
         logger.exception(f"Exception details for {context_id}:")
@@ -1336,7 +2024,7 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
         # Print a shorter message to console
         print(f"Error categorizing transaction: {e}")
         
-        # Use a detailed fallback with error information
+        # Use our fallback with error information
         fallback_result = ("Uncategorized", 0.0, f"Failed to categorize due to error: {e}")
         
         # Cache the fallback result too
@@ -1349,6 +2037,14 @@ def categorize_with_gpt4_advanced(df_row, existing_rules, past_transactions):
                 'Date': df_row['Date'],
                 'Source': df_row['Source']
             },
+            'hits': 1,
+            'error': str(e)
+        }
+        
+        # Also cache in the simplified cache
+        CATEGORIZE_CACHE[simple_cache_key] = {
+            'result': fallback_result,
+            'timestamp': datetime.now().isoformat(),
             'hits': 1,
             'error': str(e)
         }
@@ -1420,39 +2116,58 @@ def categorize_transaction(df_row, past_transactions):
         # If we have a result field but in unknown format, log and continue to rules
         logger.debug(f"Cache format issue for {df_row['Description'][:20]}..., continuing to rule check")
     
+    # Get the fuzzy threshold from global args if available
+    fuzzy_threshold = 80  # Default
+    if 'args' in globals() and hasattr(globals()['args'], 'fuzzy_threshold'):
+        fuzzy_threshold = globals()['args'].fuzzy_threshold
+    
     # Check custom and hardcoded rules
     for rule in CUSTOM_RULES:
-        # Check both normalized and original description to ensure backward compatibility
+        # Use fuzzy matching for both normalized and original description
         # Also check if amount matches (if specified) and day is in range
-        if ((rule["description"] in desc or rule["description"] in original_desc) and 
+        try:
+            transaction_day = pd.to_datetime(df_row["Date"]).day
+            day_in_range = transaction_day in range(rule["day_range"][0], rule["day_range"][1] + 1)
+        except:
+            day_in_range = True  # If date parsing fails, ignore day range check
+            
+        if ((fuzzy_match(rule["description"], desc, fuzzy_threshold) or 
+             fuzzy_match(rule["description"], original_desc, fuzzy_threshold)) and 
             (rule["amount"] is None or df_row["Amount"] == rule["amount"]) and 
-            pd.to_datetime(df_row["Date"]).day in rule["day_range"]):
+            day_in_range):
             
             # Create the cache entries for this hit
-            result = (rule["category"], 1.0, "Matched custom rule")
+            match_type = "fuzzy" if rule["description"] not in desc and rule["description"] not in original_desc else "exact"
+            confidence = 0.95 if match_type == "exact" else 0.9  # Slightly lower confidence for fuzzy matches
+            result = (rule["category"], confidence, f"Matched custom rule ({match_type} match)")
+            
+            # Log the match details for debugging
+            logger.debug(f"Rule match: '{rule['description']}' -> '{desc}' ({match_type} match, {confidence:.2f} confidence)")
             
             # Add to cache
             CATEGORIZE_CACHE[cache_key] = {
                 'result': result,
                 'timestamp': datetime.now().isoformat(),
                 'hits': 1,
-                'rule_based': True
+                'rule_based': True,
+                'match_type': match_type
             }
             
             return result
     
     # Check expanded hardcoded rules next      
     for category, keywords in CATEGORY_RULES.items():
-        # Check both normalized and original description
+        # First check for exact matches (faster)
         if any(keyword.lower() in desc for keyword in keywords) or any(keyword.lower() in original_desc for keyword in keywords):
-            result = (category, 1.0, "Matched hardcoded rule")
+            result = (category, 1.0, "Matched hardcoded rule (exact match)")
             
             # Add to cache
             CATEGORIZE_CACHE[cache_key] = {
                 'result': result,
                 'timestamp': datetime.now().isoformat(),
                 'hits': 1,
-                'rule_based': True
+                'rule_based': True,
+                'match_type': 'exact'
             }
             
             # Save cache periodically
@@ -1461,11 +2176,79 @@ def categorize_transaction(df_row, past_transactions):
                 
             return result
             
-    # Fallback to LLM only if no rule match
-    category, confidence, reasoning = categorize_with_gpt4_advanced(df_row, {"hardcoded": CATEGORY_RULES, "custom": CUSTOM_RULES}, past_transactions)
+        # If no exact match, try fuzzy matching
+        # This is separated from exact matching to prioritize exact matches and improve performance
+        for keyword in keywords:
+            if (fuzzy_match(keyword.lower(), desc, fuzzy_threshold) or 
+                fuzzy_match(keyword.lower(), original_desc, fuzzy_threshold)):
+                
+                # Log the match for debugging
+                logger.debug(f"Fuzzy match: '{keyword}' -> '{desc}' (category: {category})")
+                
+                result = (category, 0.9, "Matched hardcoded rule (fuzzy match)")
+                
+                # Add to cache
+                CATEGORIZE_CACHE[cache_key] = {
+                    'result': result,
+                    'timestamp': datetime.now().isoformat(),
+                    'hits': 1,
+                    'rule_based': True,
+                    'match_type': 'fuzzy'
+                }
+                
+                # Save cache periodically
+                if len(CATEGORIZE_CACHE) % 20 == 0:
+                    save_cache(CATEGORIZE_CACHE, CATEGORIZE_CACHE_FILE)
+                    
+                return result
+            
+    # Fallback to enhanced LLM categorization if no rule match
     
-    # Only log high confidence suggestions to reduce console output
-    if confidence > 0.8 and category != "Uncategorized":
+    # Create example transactions for each category to improve context
+    examples = {
+        "Entertainment": ["netflix subscription $14.99", "movie theater tickets $24.00", "spotify premium $9.99"],
+        "Food": ["starbucks coffee $5.95", "doordash delivery $35.50", "grocery store $125.75"],
+        "Payments": ["bank transfer $500.00", "paypal payment $95.00", "bill payment $145.00"],
+        "Shopping": ["amazon purchase $45.99", "walmart $87.50", "target $63.25"],
+        "Travel": ["uber trip $22.50", "hotel booking $199.00", "airline ticket $350.00"],
+        "Fees": ["atm fee $3.00", "overdraft fee $35.00", "credit card annual fee $95.00"],
+        "Subscriptions": ["monthly service $8.99", "software subscription $15.00", "streaming service $12.99"],
+        "Insurance": ["auto insurance premium $125.00", "health insurance $210.00", "renters insurance $15.00"],
+        "Investments": ["stock purchase $500.00", "crypto purchase $100.00", "retirement contribution $250.00"],
+        "Rent": ["apartment rent $1500.00", "mortgage payment $2200.00", "housing payment $1900.00"],
+        "Income": ["salary deposit $3500.00", "client payment $750.00", "tax refund $1200.00"]
+    }
+    
+    # If we have corrections data, use it to enhance examples
+    if CORRECTIONS:
+        # Get up to 2 examples per category from user corrections
+        for correction in CORRECTIONS:
+            category = correction.get("new_category")
+            if category in examples and len(examples[category]) < 5:  # Limit to 5 examples per category
+                txn = correction.get("transaction", {})
+                desc_text = txn.get("Description", "")
+                amount = txn.get("Amount", 0)
+                if desc_text and amount:
+                    examples[category].append(f"{desc_text} ${amount:.2f}")
+    
+    # Use the existing LLM function but pass our enhanced examples through the past_transactions param
+    category, confidence, reasoning = categorize_with_gpt4_advanced(
+        df_row, 
+        {"hardcoded": CATEGORY_RULES, "custom": CUSTOM_RULES}, 
+        {"examples": examples, "dataframe": past_transactions}
+    )
+    
+    # Apply confidence threshold for automatic acceptance
+    threshold = 0.8  # Only accept LLM suggestions with confidence >= 0.8
+    if confidence < threshold:
+        # Keep the original confidence score but mark as needing review
+        original_category = category
+        original_reasoning = reasoning
+        category = "Uncategorized"
+        reasoning = f"Low confidence ({confidence:.2f}) for '{original_category}'. Original reasoning: {original_reasoning}"
+        logger.info(f"Low confidence categorization ({confidence:.2f}) for '{df_row['Description'][:30]}' - marked for review")
+    elif category != "Uncategorized":
+        # Only log high confidence suggestions to reduce console output
         logger.info(f"LLM suggested: {category} for '{desc}' (Confidence: {confidence})")
         
     return category, confidence, reasoning
@@ -1531,26 +2314,94 @@ def process_pdf(file_path, source_name):
 
 def process_csv(file_path, source_name):
     all_data = []
-    if "boa" in source_name.lower() or "estmt" in source_name.lower():
-        source = "BoA"
-        df = pd.read_csv(file_path, usecols=["Posted Date", "Payee", "Amount"])
-        df.columns = ["Date", "Description", "Amount"]
-    elif "sfcu" in source_name.lower() or "accounthistory" in source_name.lower():
-        source = "SFCU"
-        df = pd.read_csv(file_path)
-        df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
-        df = df[["Post Date", "Description", "Amount"]]
-        df.columns = ["Date", "Description", "Amount"]
-    elif "citi" in source_name.lower():
-        source = "Citi"
-        df = pd.read_csv(file_path, usecols=["Posted Date", "Payee", "Amount"])
-        df.columns = ["Date", "Description", "Amount"]
-    else:
-        source = "Unknown"
+    # Detailed logging for CSV processing
+    logger.info(f"Processing CSV file: {file_path}")
+    
+    try:
+        if "boa" in source_name.lower() or "estmt" in source_name.lower():
+            source = "BoA"
+            logger.info(f"Identified as Bank of America CSV format")
+            df = pd.read_csv(file_path, usecols=["Posted Date", "Payee", "Amount"])
+            df.columns = ["Date", "Description", "Amount"]
+        elif "sfcu" in source_name.lower() or "accounthistory" in source_name.lower():
+            source = "SFCU"
+            logger.info(f"Identified as SFCU CSV format")
+            df = pd.read_csv(file_path)
+            df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
+            df = df[["Post Date", "Description", "Amount"]]
+            df.columns = ["Date", "Description", "Amount"]
+        elif "citi" in source_name.lower():
+            source = "Citi"
+            logger.info(f"Identified as Citibank CSV format")
+            df = pd.read_csv(file_path, usecols=["Posted Date", "Payee", "Amount"])
+            df.columns = ["Date", "Description", "Amount"]
+        elif "chase" in source_name.lower():
+            source = "Chase"
+            logger.info(f"Identified as Chase CSV format")
+            df = pd.read_csv(file_path, usecols=["Transaction Date", "Description", "Amount"])
+            df.columns = ["Date", "Description", "Amount"]
+        elif "amex" in source_name.lower() or "american" in source_name.lower():
+            source = "AMEX"
+            logger.info(f"Identified as American Express CSV format")
+            df = pd.read_csv(file_path, usecols=["Date", "Description", "Amount"])
+        elif "discover" in source_name.lower():
+            source = "Discover"
+            logger.info(f"Identified as Discover CSV format")
+            df = pd.read_csv(file_path, usecols=["Trans. Date", "Description", "Amount"])
+            df.columns = ["Date", "Description", "Amount"]
+        elif "capital" in source_name.lower() or "cap1" in source_name.lower():
+            source = "Capital One"
+            logger.info(f"Identified as Capital One CSV format")
+            df = pd.read_csv(file_path, usecols=["Transaction Date", "Description", "Debit"])
+            df.columns = ["Date", "Description", "Amount"]
+        else:
+            # Try to infer the format from column names if source is unknown
+            source = "Unknown"
+            logger.warning(f"Unknown CSV format for {file_path}, attempting to infer format")
+            
+            # Read the CSV file and check its columns
+            try:
+                df_temp = pd.read_csv(file_path)
+                logger.info(f"CSV columns: {df_temp.columns.tolist()}")
+                
+                # Look for date, description and amount columns with various possible names
+                date_cols = [col for col in df_temp.columns if 'date' in col.lower() or 'post' in col.lower()]
+                desc_cols = [col for col in df_temp.columns if 'desc' in col.lower() or 'payee' in col.lower() or 'narration' in col.lower()]
+                amount_cols = [col for col in df_temp.columns if 'amount' in col.lower() or 'debit' in col.lower() or 'credit' in col.lower()]
+                
+                if date_cols and desc_cols and (amount_cols or ('debit' in df_temp.columns.str.lower() and 'credit' in df_temp.columns.str.lower())):
+                    logger.info(f"Inferred columns - Date: {date_cols[0]}, Description: {desc_cols[0]}, Amount: {amount_cols[0] if amount_cols else 'debit/credit'}")
+                    
+                    # Use the first matching columns
+                    if amount_cols:
+                        df = df_temp[[date_cols[0], desc_cols[0], amount_cols[0]]]
+                        df.columns = ["Date", "Description", "Amount"]
+                    else:
+                        # Handle separate debit/credit columns
+                        debit_col = [col for col in df_temp.columns if 'debit' in col.lower()][0]
+                        credit_col = [col for col in df_temp.columns if 'credit' in col.lower()][0]
+                        df = df_temp[[date_cols[0], desc_cols[0], debit_col, credit_col]]
+                        # Combine debit and credit into a single amount column
+                        df["Amount"] = df[credit_col].fillna(0) - df[debit_col].fillna(0)
+                        df = df[[date_cols[0], desc_cols[0], "Amount"]]
+                        df.columns = ["Date", "Description", "Amount"]
+                else:
+                    logger.error(f"Could not infer CSV format for {file_path}, skipping")
+                    return all_data
+            except Exception as e:
+                logger.error(f"Error inferring CSV format: {e}")
+                return all_data
+    except Exception as e:
+        logger.error(f"Error processing CSV file {file_path}: {e}")
         return all_data
 
+    # Add source and file information
     df["Source"] = source
     df["File"] = file_path
+    
+    row_count = len(df)
+    logger.info(f"Successfully processed {row_count} transactions from {source} CSV")
+    
     return df.values.tolist()
 
 def print_progress_bar(iteration, total, prefix='', suffix='', length=50, fill='█', print_end="\r"):
@@ -1609,20 +2460,36 @@ def view_logs(num_lines=50, level="ALL", contains=None):
 def main():
     # Set up command-line argument parsing
     parser = argparse.ArgumentParser(description="Expense Tracker: Process and categorize financial transactions")
+    
+    # Core functionality options
     parser.add_argument("--review", action="store_true", help="Enable interactive review of low-confidence transactions")
     parser.add_argument("--skip-normalization", action="store_true", help="Skip LLM-based description normalization (faster)")
     parser.add_argument("--skip-llm-dedup", action="store_true", help="Skip LLM-based deduplication (faster)")
     parser.add_argument("--skip-rule-gen", action="store_true", help="Skip automatic rule generation")
     parser.add_argument("--fast", action="store_true", help="Run in fast mode (skips all LLM features)")
+    parser.add_argument("--fuzzy-threshold", type=int, default=80, help="Fuzzy matching threshold (0-100, default: 80)")
+    
+    # Display and logging options
     parser.add_argument("--verbose", action="store_true", help="Show detailed progress information")
     parser.add_argument("--view-logs", action="store_true", help="View recent log entries")
     parser.add_argument("--log-lines", type=int, default=50, help="Number of log lines to view")
     parser.add_argument("--log-level", choices=["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], 
                         default="ALL", help="Filter logs by level")
     parser.add_argument("--log-contains", type=str, help="Filter logs by content")
+    
+    # Rule management options
     parser.add_argument("--suggest-rules", action="store_true", help="Get suggestions for custom payment rules")
     parser.add_argument("--analyze-uncategorized", action="store_true", 
                         help="Analyze uncategorized transactions and suggest rules")
+    
+    # API usage optimization options
+    parser.add_argument("--model-downgrade", action="store_true", 
+                       help="Use gpt-3.5-turbo for all tasks (except rule generation)")
+    parser.add_argument("--batch-size", type=int, default=50,
+                       help="Maximum batch size for batch processing (default: 50)")
+    parser.add_argument("--api-stats", action="store_true",
+                       help="Show detailed API usage statistics")
+    
     args = parser.parse_args()
     
     # Handle the view-logs command
@@ -1690,6 +2557,34 @@ def main():
         args.skip_llm_dedup = True
         args.skip_rule_gen = True
         print("Running in fast mode - all LLM features disabled")
+        
+    # Model downgrade handling moved into main function instead of call_llm
+    model_downgrade = args.model_downgrade if hasattr(args, 'model_downgrade') else False
+    if model_downgrade:
+        # Force GPT-3.5 for all tasks except rule generation, which needs the stronger model
+        print("Using gpt-3.5-turbo for all tasks except rule generation (model downgrade enabled)")
+        # We'll pass this as a parameter to functions that need it
+        
+    # Set the batch size for batch processing as a global variable
+    global max_batch_size, fuzzy_threshold
+    max_batch_size = args.batch_size
+    fuzzy_threshold = args.fuzzy_threshold
+    print(f"Maximum batch size set to {max_batch_size} transactions")
+    print(f"Fuzzy matching enabled with threshold {fuzzy_threshold} - will catch similar transaction descriptions")
+    
+    # Reset API usage tracking for this run
+    global API_USAGE
+    API_USAGE = {
+        "total_calls": 0,
+        "gpt4_calls": 0,
+        "gpt35_calls": 0,
+        "normalization_calls": 0,
+        "categorization_calls": 0,
+        "rule_generation_calls": 0,
+        "deduplication_calls": 0,
+        "token_estimate": 0,
+        "cost_estimate": 0.0
+    }
     
     # Performance tracking
     start_time_total = time.time()
@@ -1729,8 +2624,8 @@ def main():
         cache_hits = sum(1 for desc in df["Description"] if hashlib.md5(desc.encode()).hexdigest() in NORMALIZE_CACHE)
         print(f"Found {cache_hits}/{len(df)} descriptions already in cache")
         
-        # Process in larger batches for efficiency
-        batch_size = 20
+        # Process in batches according to specified max_batch_size
+        batch_size = max_batch_size
         start_time = time.time()
         last_save_time = time.time()
         save_interval = 60  # Save at least every 60 seconds
@@ -1744,7 +2639,7 @@ def main():
             batch = df.iloc[i:i+batch_size]
             descriptions = batch["Description"].tolist()
             
-            # Process batch and update dataframe
+            # Process batch and update dataframe - use global max_batch_size
             normalized_descriptions = normalize_descriptions_batch(descriptions)
             df.loc[batch.index, "NormalizedDesc"] = normalized_descriptions
             
@@ -1802,8 +2697,8 @@ def main():
     # Check if we can resume from an existing file
     if os.path.exists(DEDUPE_CSV):
         print(f"Found existing progress file: {DEDUPE_CSV}")
-        resume_choice = input("Resume from existing progress? (y/n): ").lower().strip()
-        if resume_choice == 'y':
+        resume_choice = input("Resume from existing progress? ").lower().strip()
+        if any(yes_word in resume_choice for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it']):
             try:
                 saved_df = pd.read_csv(DEDUPE_CSV)
                 # Check if this is a valid saved file with required columns
@@ -1973,8 +2868,8 @@ def main():
     if os.path.exists(DEDUPE_CSV):
         print(f"Found existing deduplicated file: {DEDUPE_CSV}")
         # If we've made it this far and there's a dedupe file, we probably want to resume
-        resume_dedupe = input("Skip deduplication and use existing file? (y/n): ").lower().strip()
-        if resume_dedupe == 'y':
+        resume_dedupe = input("Skip deduplication and use existing file? ").lower().strip()
+        if any(yes_word in resume_dedupe for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'skip', 'use existing']):
             try:
                 deduped_df = pd.read_csv(DEDUPE_CSV)
                 # Verify it has the required columns
@@ -2022,8 +2917,14 @@ def main():
         print("Analyzing low confidence transactions for rule generation...")
         should_recategorize_low_conf = generate_low_confidence_rules(deduped_df)
         
-        # Combine results - recategorize if either function suggests it
-        should_recategorize = should_recategorize or should_recategorize_low_conf
+        # Check if we have user corrections to analyze
+        should_recategorize_corrections = False
+        if CORRECTIONS:
+            print("Analyzing user corrections for rule generation...")
+            should_recategorize_corrections = generate_rules_from_corrections()
+        
+        # Combine results - recategorize if any function suggests it
+        should_recategorize = should_recategorize or should_recategorize_low_conf or should_recategorize_corrections
         
         # Re-categorize if new rules were added and user wants to apply them
         if should_recategorize:
@@ -2083,8 +2984,8 @@ def main():
     uncategorized_count = sum(deduped_df["Category"] == "Uncategorized")
     if uncategorized_count > 0 and not args.review:
         print(f"\nThere are still {uncategorized_count} uncategorized transactions.")
-        review_prompt = input("Would you like to review these now? (y/n): ").lower().strip()
-        if review_prompt == 'y':
+        review_prompt = input("Would you like to review these now? ").lower().strip()
+        if any(yes_word in review_prompt for yes_word in ['y', 'yes', 'yeah', 'sure', 'ok', 'please', 'do it']):
             interactive_review(deduped_df)
         
     # Final performance stats
@@ -2114,6 +3015,18 @@ def main():
     logger.info(f"Cache statistics:")
     logger.info(f"- Normalization cache: {normalize_cache_size} entries")
     logger.info(f"- Categorization cache: {categorize_cache_size} entries")
+    
+    # Log API usage statistics
+    logger.info("API usage statistics:")
+    logger.info(f"- Total API calls: {API_USAGE['total_calls']}")
+    logger.info(f"- GPT-4 calls: {API_USAGE['gpt4_calls']}")
+    logger.info(f"- GPT-3.5 calls: {API_USAGE['gpt35_calls']}")
+    logger.info(f"- Normalization calls: {API_USAGE['normalization_calls']}")
+    logger.info(f"- Categorization calls: {API_USAGE['categorization_calls']}")
+    logger.info(f"- Rule generation calls: {API_USAGE['rule_generation_calls']}")
+    logger.info(f"- Deduplication calls: {API_USAGE['deduplication_calls']}")
+    logger.info(f"- Estimated tokens: {int(API_USAGE['token_estimate'])}")
+    logger.info(f"- Estimated cost: ${API_USAGE['cost_estimate']:.4f}")
     
     # Print summary to console
     print("\n" + "="*50)
@@ -2169,6 +3082,46 @@ def main():
     print(f"  {cache_stats['normalize_cache_hits']} hits ({normalize_hit_rate:.1f}% hit rate)")
     print(f"- Categorization cache: {cache_stats['categorize_cache_size']} entries")
     print(f"  {cache_stats['categorize_cache_hits']} hits ({categorize_hit_rate:.1f}% hit rate)")
+    
+    # If we tracked match types, show the matching statistics
+    exact_matches = sum(1 for key, cache_item in CATEGORIZE_CACHE.items() 
+                      if cache_item.get('match_type') == 'exact')
+    fuzzy_matches = sum(1 for key, cache_item in CATEGORIZE_CACHE.items() 
+                      if cache_item.get('match_type') == 'fuzzy')
+    llm_matches = sum(1 for key, cache_item in CATEGORIZE_CACHE.items() 
+                     if cache_item.get('match_type') == 'llm')
+    
+    total_categorized = exact_matches + fuzzy_matches + llm_matches
+    
+    if total_categorized > 0:
+        print("\nCategorization Method Statistics:")
+        print(f"- Rule-based exact matches: {exact_matches} ({(exact_matches/total_categorized)*100:.1f}%)")
+        print(f"- Rule-based fuzzy matches: {fuzzy_matches} ({(fuzzy_matches/total_categorized)*100:.1f}%) (threshold: {fuzzy_threshold})")
+        print(f"- LLM-based categorization: {llm_matches} ({(llm_matches/total_categorized)*100:.1f}%)")
+        
+        if fuzzy_matches > 0 and (exact_matches + fuzzy_matches) > 0:
+            rule_matches = exact_matches + fuzzy_matches
+            fuzzy_percentage = (fuzzy_matches / rule_matches) * 100
+            print(f"- {fuzzy_percentage:.1f}% of rule-based matches were fuzzy matches")
+            
+        # Show fuzzy matching cost savings
+        if fuzzy_matches > 0:
+            # Assuming average cost of $0.0001 per LLM categorization (very rough estimate)
+            estimated_savings = fuzzy_matches * 0.0001
+            print(f"- Estimated cost savings from fuzzy matching: ${estimated_savings:.4f}")
+    
+    # API usage statistics
+    print("\nAPI Usage Statistics:")
+    print(f"- Total API calls: {API_USAGE['total_calls']}")
+    print(f"- GPT-4 calls: {API_USAGE['gpt4_calls']}")
+    print(f"- GPT-3.5 calls: {API_USAGE['gpt35_calls']}")
+    print(f"- By purpose:")
+    print(f"  - Normalization: {API_USAGE['normalization_calls']}")
+    print(f"  - Categorization: {API_USAGE['categorization_calls']}")
+    print(f"  - Rule generation: {API_USAGE['rule_generation_calls']}")
+    print(f"  - Deduplication: {API_USAGE['deduplication_calls']}")
+    print(f"- Estimated tokens: {int(API_USAGE['token_estimate'])}")
+    print(f"- Estimated cost: ${API_USAGE['cost_estimate']:.4f}")
     
     print("\n" + "="*50)
     print(f"Processing complete! Results saved to {DEDUPE_CSV}")

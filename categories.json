@@ -25,7 +25,88 @@
                 1,
                 31
             ],
-            "category": "Uncategorized"
+            "category": "Investments"
+        },
+        {
+            "description": "ATM Withdrawal",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Payments"
+        },
+        {
+            "description": "Chevron",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Travel"
+        },
+        {
+            "description": "withdrawal",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Payments"
+        },
+        {
+            "description": "zelle ",
+            "amount": null,
+            "day_range": [
+                1,
+                5
+            ],
+            "category": "Rent"
+        },
+        {
+            "description": "paypal",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Payments"
+        },
+        {
+            "description": "cash app",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Entertainment"
+        },
+        {
+            "description": "zelle ",
+            "amount": null,
+            "day_range": [
+                1,
+                5
+            ],
+            "category": "Rent"
+        },
+        {
+            "description": "paypal",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Shopping"
+        },
+        {
+            "description": "cash app",
+            "amount": null,
+            "day_range": [
+                1,
+                31
+            ],
+            "category": "Payments"
         }
     ]
 }
